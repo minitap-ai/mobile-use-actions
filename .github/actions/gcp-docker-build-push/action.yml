@@ -30,13 +30,38 @@ inputs:
     required: false
     description: "Docker build context"
     default: ${{ github.workspace }}
+  build-target:
+    required: false
+    description: "Docker build target"
   build-args:
     required: false
     description: "Docker build argument"
+  build-secrets:
+    required: false
+    description: "BuildKit secrets to pass to docker build (newline-separated KEY=VALUE pairs, mounted via --mount=type=secret)"
   cache-key:
     required: false
     description: "Docker build extra cache key - useful for tags involving drastic changes in the image build"
     default: ""
+  cache-backend:
+    required: false
+    description: "Build cache backend: 'registry' (default, shared across runners via Artifact Registry) or 'gha' (GitHub Actions cache, co-located with the runner and much faster to import/export)"
+    default: registry
+  cache-mode:
+    required: false
+    description: "BuildKit cache export mode: 'max' (default, caches every intermediate layer) or 'min' (final layers only, far smaller transfer on cold runners)"
+    default: max
+  cache-scope:
+    required: false
+    description: "Cache scope key for the 'gha' backend - set a distinct value per build-target when several targets share one workflow so their caches don't collide"
+    default: ""
+outputs:
+  digest:
+    description: "Immutable digest of the pushed image"
+    value: ${{ steps.immutable.outputs.digest }}
+  image-uri:
+    description: "Immutable URI of the pushed image"
+    value: ${{ steps.immutable.outputs.image-uri }}
 runs:
   using: "composite"
   steps:
@@ -63,8 +88,18 @@ runs:
         IMAGE_TAG: ${{ inputs.image-tag }}
       run: |
         IMAGE="$GCP_REGION-docker.pkg.dev/$GCP_PROJECT_ID/$GCP_ARTIFACT_REPO/$IMAGE_NAME"
-        if [ ! -z "$IMAGE_TAG" ]; then
-          TAGS="$IMAGE:$IMAGE_TAG"
+        if [ -n "$IMAGE_TAG" ]; then
+          TAGS=""
+          while IFS= read -r tag || [ -n "$tag" ]; do
+            tag=$(echo "$tag" | xargs)
+            if [ -n "$tag" ]; then
+              if [ -z "$TAGS" ]; then
+                TAGS="$IMAGE:$tag"
+              else
+                TAGS="$TAGS,$IMAGE:$tag"
+              fi
+            fi
+          done <<< "$IMAGE_TAG"
         elif [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
           TAGS="$IMAGE:${GITHUB_REF_NAME}"
         elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
@@ -72,15 +107,35 @@ runs:
         elif [[ "${GITHUB_REF_NAME}" == "development" ]]; then
           TAGS="$IMAGE:dev"
         else
-          echo "No matching condition for build, skipping."
-          exit 0
+          echo "Unsupported ref for image publishing: ${GITHUB_REF_TYPE}/${GITHUB_REF_NAME}" >&2
+          exit 1
         fi
         CACHE_KEY=""
-        if [ ! -z "${{ inputs.cache-key }}" ]; then
+        if [ -n "${{ inputs.cache-key }}" ]; then
           CACHE_KEY="-${{ inputs.cache-key }}"
         fi
+        echo "image=$IMAGE" >> $GITHUB_OUTPUT
         echo "tags=$TAGS" >> $GITHUB_OUTPUT
         echo "cache-image=$IMAGE:buildcache${CACHE_KEY}" >> $GITHUB_OUTPUT
+
+    - name: Resolve build cache config
+      shell: bash
+      id: cache
+      env:
+        CACHE_BACKEND: ${{ inputs.cache-backend }}
+        CACHE_MODE: ${{ inputs.cache-mode }}
+        CACHE_SCOPE: ${{ inputs.cache-scope }}
+        CACHE_IMAGE: ${{ steps.vars.outputs.cache-image }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+      run: |
+        if [ "$CACHE_BACKEND" = "gha" ]; then
+          SCOPE="${CACHE_SCOPE:-$IMAGE_NAME}"
+          echo "cache-from=type=gha,scope=$SCOPE" >> $GITHUB_OUTPUT
+          echo "cache-to=type=gha,scope=$SCOPE,mode=$CACHE_MODE" >> $GITHUB_OUTPUT
+        else
+          echo "cache-from=type=registry,ref=$CACHE_IMAGE" >> $GITHUB_OUTPUT
+          echo "cache-to=type=registry,ref=$CACHE_IMAGE,mode=$CACHE_MODE" >> $GITHUB_OUTPUT
+        fi
 
     - name: Set up QEMU and Buildx
       uses: docker/setup-buildx-action@v3
@@ -95,14 +150,27 @@ runs:
         chmod 600 $HOME/.netrc
 
     - name: Build and push with .netrc secret
+      id: build
       uses: docker/build-push-action@v6
       with:
         push: true
         file: ${{ inputs.dockerfile }}
+        target: ${{ inputs.build-target }}
         context: ${{ inputs.build-context }}
         tags: ${{ steps.vars.outputs.tags }}
         build-args: ${{ inputs.build-args }}
+        secrets: ${{ inputs.build-secrets }}
         secret-files: |
           netrc=/home/runner/.netrc
-        cache-from: type=registry,ref=${{ steps.vars.outputs.cache-image }}
-        cache-to: type=registry,ref=${{ steps.vars.outputs.cache-image }},mode=max
+        cache-from: ${{ steps.cache.outputs.cache-from }}
+        cache-to: ${{ steps.cache.outputs.cache-to }}
+
+    - name: Export immutable image reference
+      id: immutable
+      shell: bash
+      env:
+        IMAGE: ${{ steps.vars.outputs.image }}
+        DIGEST: ${{ steps.build.outputs.digest }}
+      run: |
+        echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+        echo "image-uri=$IMAGE@$DIGEST" >> "$GITHUB_OUTPUT"
